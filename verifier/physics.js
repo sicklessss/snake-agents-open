@@ -1,21 +1,29 @@
 'use strict';
 
-const C = require('./config');
-const S = require('./state');
+// Port of snake-agents/lib/physics-engine.js — self-contained.
+//
+// Removed runtime-only dependencies so the verifier can re-run physics
+// offline with no blockchain/state/logger wiring:
+//   - `C` (config)     → pulled from ./constants.js
+//   - `S` (global state) + `BC` (blockchain): lockBetting TX block dropped
+//   - `C.log`          → removed; verifier is silent by default
+//   - `BM.isOpposite`  → inlined below
+//   - `room.startGameOver(...)` call         → replaced with a terminal flag
+//
+// Everything else MUST match lib/physics-engine.js byte-for-byte so the
+// verifier reproduces the server's recorded frames exactly.
 
-/**
- * Core tick processing: obstacle updates, AI moves, food, movement,
- * collision detection, death timers, victory/wipeout checks, betting lock.
- * Called once per tick from GameRoom.tick().
- *
- * @param {import('./game-room')} room - The GameRoom instance
- */
+const C = require('./constants');
+
+function isOpposite(dir1, dir2) {
+    return dir1.x === -dir2.x && dir1.y === -dir2.y;
+}
+
 function processTick(room) {
     // --- Competitive: Obstacle System ---
     if (room.type === 'competitive' && room.gameState === 'PLAYING') {
         room.obstacleTick++;
 
-        // Update blink timers
         for (const obs of room.obstacles) {
             if (!obs.solid && obs.blinkTimer > 0) {
                 obs.blinkTimer--;
@@ -25,25 +33,24 @@ function processTick(room) {
             }
         }
 
-        // Spawn new obstacle every 80 ticks
         if (room.obstacleTick % 80 === 0) {
             spawnObstacle(room);
         }
     }
 
-    // Auto-move for bots without ws connection (flood-fill AI)
+    // Auto-move for bots without ws connection (flood-fill AI).
+    // In the verifier this branch is never taken: we replay the recorded
+    // inputLog, which sets nextDirection before tick() runs.
     Object.values(room.players).forEach((p) => {
         if (!p.ws && p.alive) {
             floodFillMove(room, p);
         }
     });
 
-    // Competitive: food cap decreases every 30s (5->4->3->2->1->0)
     const foodCap = room.type === 'competitive'
         ? Math.max(0, Math.ceil(room.matchTimeLeft / 30) - 1)
         : C.MAX_FOOD;
 
-    // Remove excess food if cap decreased
     while (room.food.length > foodCap) {
         room.food.pop();
     }
@@ -52,7 +59,6 @@ function processTick(room) {
         let tries = 0;
         let fx, fy;
         do {
-            // Deterministic seeded RNG — see game-room.js mulberry32 comment.
             fx = Math.floor(room.rng() * C.CONFIG.gridSize);
             fy = Math.floor(room.rng() * C.CONFIG.gridSize);
             tries++;
@@ -70,7 +76,6 @@ function processTick(room) {
     Object.values(room.players).forEach((p) => {
         if (!p.alive) return;
 
-        // HP drain: 1 HP per tick
         p.hp -= 1;
         if (p.hp <= 0) {
             killPlayer(room, p, 'starvation');
@@ -95,7 +100,7 @@ function processTick(room) {
         if (foodIndex !== -1) {
             room.food.splice(foodIndex, 1);
             p.score++;
-            p.hp = 100; // Eating food restores HP to full
+            p.hp = 100;
         } else {
             p.body.pop();
         }
@@ -127,7 +132,6 @@ function processTick(room) {
             }
         });
 
-        // Competitive: Check obstacle collision
         if (room.type === 'competitive' && p.alive) {
             for (const obs of room.obstacles) {
                 if (obs.solid && obs.x === head.x && obs.y === head.y) {
@@ -231,36 +235,19 @@ function processTick(room) {
         }
     });
 
-    // Ensure betting is locked on-chain as soon as the match starts.
-    if (room.gameState === 'PLAYING' && !room._bettingLockSent && S.pariMutuelContract) {
-        room._bettingLockSent = true;
-        const matchId = room.currentMatchId;
-        const BC = require('./blockchain');
-        BC.enqueueLifecycleTx(`lockBetting ${matchId}`, async (overrides) => {
-            const tx = await S.pariMutuelContract.lockBetting(matchId, overrides);
-            await tx.wait(1, 60000);
-            C.log.info(`[PariMutuel] lockBetting #${matchId} confirmed`);
-        });
-    }
+    // server-only: betting-lock TX omitted in verifier.
 
     const totalPlayers = Object.keys(room.players).length;
     if (totalPlayers > 1 && aliveCount === 1) {
         room.victoryPauseTimer = 24;
         room.lastSurvivorForVictory = lastSurvivor;
     } else if (totalPlayers > 1 && aliveCount === 0) {
-        room.startGameOver(null, 'wipeout');
+        // server calls room.startGameOver(null, 'wipeout'); verifier just flags.
+        room._terminal = 'wipeout';
     }
 }
 
-/**
- * AI pathfinding for bots without a WebSocket connection.
- * Uses flood-fill to pick the safest direction toward food.
- *
- * @param {import('./game-room')} room
- * @param {object} p - The player object
- */
 function floodFillMove(room, p) {
-    const BM = require('./bot-manager');
     const head = p.body[0];
     const G = C.CONFIG.gridSize;
     const dirs = [
@@ -268,7 +255,6 @@ function floodFillMove(room, p) {
         { x: 0, y: 1 }, { x: 0, y: -1 }
     ];
 
-    // Build grid: 0=empty, 1=blocked
     const grid = [];
     for (let y = 0; y < G; y++) {
         grid[y] = new Uint8Array(G);
@@ -277,13 +263,11 @@ function floodFillMove(room, p) {
         if (!other.body) return;
         other.body.forEach((seg, idx) => {
             if (seg.x >= 0 && seg.x < G && seg.y >= 0 && seg.y < G) {
-                // Skip each snake's tail tip -- it will be popped on next move (unless eating food)
                 if (other.alive && idx === other.body.length - 1) return;
                 grid[seg.y][seg.x] = 1;
             }
         });
     });
-    // Add solid obstacles
     if (room.obstacles) {
         room.obstacles.forEach(obs => {
             if (obs.solid && obs.x >= 0 && obs.x < G && obs.y >= 0 && obs.y < G)
@@ -291,7 +275,6 @@ function floodFillMove(room, p) {
         });
     }
 
-    // Mark enemy head adjacent cells as dangerous
     const enemyHeadDanger = new Set();
     Object.values(room.players).forEach(other => {
         if (other.id === p.id || !other.alive || !other.body || !other.body[0]) return;
@@ -306,7 +289,6 @@ function floodFillMove(room, p) {
         }
     });
 
-    // Flood fill from a position
     const floodFill = (sx, sy) => {
         if (sx < 0 || sx >= G || sy < 0 || sy >= G || grid[sy][sx] === 1) return 0;
         const visited = [];
@@ -328,9 +310,8 @@ function floodFillMove(room, p) {
         return count;
     };
 
-    // Score each direction
     const candidates = dirs
-        .filter(d => !BM.isOpposite(d, p.direction))
+        .filter(d => !isOpposite(d, p.direction))
         .map(d => {
             const nx = head.x + d.x;
             const ny = head.y + d.y;
@@ -339,16 +320,13 @@ function floodFillMove(room, p) {
 
             let score = 0;
 
-            // Flood fill space
             const space = floodFill(nx, ny);
             if (space < p.body.length) score -= 10000;
             else if (space < p.body.length * 2) score -= 2000;
             score += space * 2;
 
-            // Enemy head danger
             if (enemyHeadDanger.has(nx + ',' + ny)) score -= 5000;
 
-            // Food attraction (lower weight when long)
             const foodWeight = p.body.length < 8 ? 8 : 3;
             let bestFoodDist = G * 2;
             for (const f of (room.food || [])) {
@@ -357,11 +335,9 @@ function floodFillMove(room, p) {
             }
             score += (G * 2 - bestFoodDist) * foodWeight;
 
-            // Prefer center
             const centerDist = Math.abs(nx - G / 2) + Math.abs(ny - G / 2);
             score -= centerDist * 0.3;
 
-            // Penalize walls
             if (nx === 0 || nx === G - 1) score -= 30;
             if (ny === 0 || ny === G - 1) score -= 30;
 
@@ -373,33 +349,22 @@ function floodFillMove(room, p) {
         candidates.sort((a, b) => b.score - a.score);
         p.nextDirection = candidates[0].d;
     } else {
-        const any = dirs.filter(d => !BM.isOpposite(d, p.direction));
+        const any = dirs.filter(d => !isOpposite(d, p.direction));
         p.nextDirection = any.length > 0 ? any[Math.floor(room.rng() * any.length)] : p.direction;
     }
 }
 
-/**
- * Kill a player: mark dead, set death metadata.
- * In competitive mode, dead snake body becomes obstacles.
- *
- * @param {import('./game-room')} room
- * @param {object} p - The player object
- * @param {string} deathType
- */
 function killPlayer(room, p, deathType = 'default') {
     p.alive = false;
     p.deathTimer = C.DEATH_BLINK_TURNS;
-    p.deathTime = Date.now();
+    p.deathTime = 0; // server uses Date.now(); verifier uses 0 so it's deterministic
     p.deathType = deathType;
     p.deathSeq = ++room.deathSeq;
-
-    C.log.info(`[Death] Player "${p.name}" (${p.id}) died: ${deathType} in room ${room.id}`);
 
     if (deathType === 'eaten') {
         p.body = [p.body[0]];
     }
 
-    // Competitive arena: dead snake body becomes obstacles
     if (room.type === 'competitive' && deathType !== 'eaten' && p.body && p.body.length > 0) {
         for (const seg of p.body) {
             room.obstacles.push({
@@ -410,23 +375,14 @@ function killPlayer(room, p, deathType = 'default') {
                 fromCorpse: true,
             });
         }
-        // Remove food that overlaps with new obstacles
         room.food = room.food.filter(f => !p.body.some(seg => seg.x === f.x && seg.y === f.y));
-        C.log.info('[Competitive] Dead snake ' + p.name + ' body (' + p.body.length + ' cells) became obstacles');
     }
 }
 
-/**
- * Spawn an irregular obstacle cluster in competitive mode.
- *
- * @param {import('./game-room')} room
- */
 function spawnObstacle(room) {
-    // Deterministic seeded RNG — see game-room.js mulberry32 comment.
-    const size = Math.floor(room.rng() * 16) + 1; // 1 to 16 cells
-    const maxSize = Math.min(size, 12); // cap at 12
+    const size = Math.floor(room.rng() * 16) + 1;
+    const maxSize = Math.min(size, 12);
 
-    // Pick a random seed position (avoid edges and existing obstacles)
     let seedX, seedY, tries = 0;
     do {
         seedX = Math.floor(room.rng() * (C.CONFIG.gridSize - 4)) + 2;
@@ -434,9 +390,8 @@ function spawnObstacle(room) {
         tries++;
     } while (tries < 50 && isCellBlocked(room, seedX, seedY));
 
-    if (tries >= 50) return; // Couldn't find a good spot
+    if (tries >= 50) return;
 
-    // BFS expand from seed to create irregular shape
     const cells = [{ x: seedX, y: seedY }];
     const visited = new Set();
     visited.add(seedX + ',' + seedY);
@@ -445,12 +400,10 @@ function spawnObstacle(room) {
     const dirs = [{ x: 1, y: 0 }, { x: -1, y: 0 }, { x: 0, y: 1 }, { x: 0, y: -1 }];
 
     while (cells.length < maxSize && queue.length > 0) {
-        // Random pick from queue for irregular shapes (seeded RNG).
         const idx = Math.floor(room.rng() * queue.length);
         const current = queue[idx];
         queue.splice(idx, 1);
 
-        // Shuffle directions for randomness (seeded RNG).
         const shuffled = dirs.slice().sort(() => room.rng() - 0.5);
 
         for (const d of shuffled) {
@@ -468,7 +421,6 @@ function spawnObstacle(room) {
         }
     }
 
-    // Add obstacle cells with blink timer (16 ticks = 2 seconds)
     for (const cell of cells) {
         room.obstacles.push({
             x: cell.x,
@@ -476,21 +428,10 @@ function spawnObstacle(room) {
             solid: false,
             blinkTimer: 16
         });
-        // Remove any food on this cell
         room.food = room.food.filter(f => !(f.x === cell.x && f.y === cell.y));
     }
-
-    C.log.info('[Competitive] Spawned obstacle with ' + cells.length + ' cells at (' + seedX + ',' + seedY + ')');
 }
 
-/**
- * Check if a cell is blocked by an obstacle, player body, or food.
- *
- * @param {import('./game-room')} room
- * @param {number} x
- * @param {number} y
- * @returns {boolean}
- */
 function isCellBlocked(room, x, y) {
     for (const obs of room.obstacles) {
         if (obs.x === x && obs.y === y) return true;
@@ -507,12 +448,6 @@ function isCellBlocked(room, x, y) {
     return false;
 }
 
-/**
- * Remove obstacles and food from spawn point zones.
- * Useful when resetting for a new round.
- *
- * @param {import('./game-room')} room
- */
 function clearSpawnZone(room) {
     const radius = 3;
     for (const sp of C.SPAWN_POINTS) {
@@ -534,4 +469,5 @@ module.exports = {
     spawnObstacle,
     clearSpawnZone,
     isCellBlocked,
+    isOpposite,
 };

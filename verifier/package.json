@@ -1,0 +1,16 @@
+{
+    "name": "promdict-verifier",
+    "version": "1.0.0",
+    "description": "Verify promdict.ai match replays against the open physics engine.",
+    "main": "verify.js",
+    "bin": {
+        "verify-promdict": "./verify.js"
+    },
+    "scripts": {
+        "verify": "node verify.js"
+    },
+    "license": "MIT",
+    "engines": {
+        "node": ">=18"
+    }
+}
