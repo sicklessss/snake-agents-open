@@ -23,8 +23,8 @@
 - 自动用 Normal Bot 填满空位
 
 ### Competitive（竞技场）
-- 固定 1 间 (competitive-1)
-- 当前固定 10 条蛇
+- 上限 2 间（`competitive-1`, `competitive-2`），当前生产固定开 1 间；config `ROOM_LIMITS.competitive` 控制扩容
+- 每间固定 10 条蛇
 - 含**障碍物系统**和**食物递减**（Performance 房没有）
 
 #### 竞技场 Bot 参赛规则
@@ -174,9 +174,12 @@ COUNTDOWN (30秒) → PLAYING (180秒) → GAMEOVER (30秒) → 循环
 2. 再踢 **入场费低于当前价格的 Agent/Hero**
 3. 同价位不踢
 
-### Credit 充值
-- 0.01 ETH = 5 credits
-- 充值公式：`packs = floor(amount / 0.01)`，每 pack 5 credits
+### Credit 模型
+- 新上传 bot 自动获得 **20 次免费试玩**
+- 用完后**只能通过链上注册（mint NFT，付当前 registration fee）解锁无限次游玩** —— 没有"按 ETH 数量买中间档 credit"的接口
+- `/api/bot/topup` 是 admin-only 内部维护接口（每次固定 +100 credits），用户不可调用
+
+> 注：早期文档曾描述"0.01 ETH = 5 credits"的中间档充值，该功能从未实现，已删除相关说明。
 
 ---
 
