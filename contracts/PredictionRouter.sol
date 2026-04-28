@@ -45,6 +45,7 @@ contract PredictionRouter is Ownable, Pausable, ReentrancyGuard, EIP712 {
     event MatchBinderUpdated(address indexed binder);
     event PariMutuelUpdated(address indexed pariMutuel);
     event DisplayMatchBound(bytes32 indexed displayMatchKey, uint256 indexed matchId);
+    event DisplayMatchUnbound(bytes32 indexed displayMatchKey, uint256 indexed previousMatchId);
     event IntentExecuted(
         bytes32 indexed intentHash,
         address indexed bettor,
@@ -93,10 +94,56 @@ contract PredictionRouter is Ownable, Pausable, ReentrancyGuard, EIP712 {
         emit DisplayMatchBound(displayMatchKey, matchId);
     }
 
+    /**
+     * @notice Owner-only escape hatch: clear an existing display-match binding
+     *         so a new matchId can be bound later.
+     * @dev    HIGH-3 fix. Without this, a buggy or compromised matchBinder that
+     *         writes a wrong/malicious binding would permanently brick all future
+     *         intents for that displayMatchKey. The owner (expected to be a
+     *         multisig or hardware wallet, NOT the hot matchBinder) can reset
+     *         the binding. Intentionally NOT callable by the matchBinder.
+     */
+    function unbindDisplayMatch(bytes32 displayMatchKey) external onlyOwner {
+        uint256 previous = boundMatches[displayMatchKey];
+        require(previous != 0, "Not bound");
+        delete boundMatches[displayMatchKey];
+        emit DisplayMatchUnbound(displayMatchKey, previous);
+    }
+
     function executeIntentBet(IntentBet calldata intent, bytes calldata signature)
         external
         nonReentrant
         whenNotPaused
+        returns (uint256 matchId, bytes32 intentHash)
+    {
+        (matchId, intentHash) = _executeIntentInternal(intent, signature);
+    }
+
+    /**
+     * @notice PHASE 3c-2: batch-execute up to 20 intents in a single tx.
+     *         All-or-nothing: if any intent fails (bad sig, expired, nonce reused,
+     *         match not bound, USDC transfer fail), entire batch reverts. Backend
+     *         pre-validates intents to keep batches clean.
+     *         Saves ~40% gas per intent (amortized base 21k + warm storage reads).
+     */
+    function batchExecuteIntent(IntentBet[] calldata intents, bytes[] calldata signatures)
+        external
+        nonReentrant
+        whenNotPaused
+        returns (uint256[] memory matchIds, bytes32[] memory intentHashes)
+    {
+        uint256 n = intents.length;
+        require(n == signatures.length, "Length mismatch");
+        require(n > 0 && n <= 20, "Batch size 1-20");
+        matchIds = new uint256[](n);
+        intentHashes = new bytes32[](n);
+        for (uint256 i = 0; i < n; i++) {
+            (matchIds[i], intentHashes[i]) = _executeIntentInternal(intents[i], signatures[i]);
+        }
+    }
+
+    function _executeIntentInternal(IntentBet calldata intent, bytes calldata signature)
+        internal
         returns (uint256 matchId, bytes32 intentHash)
     {
         require(intent.bettor != address(0), "Invalid bettor");

@@ -25,6 +25,11 @@ interface IBotRegistry {
     function getBotById(bytes32 _botId) external view returns (Bot memory);
 }
 
+interface ISnakeBotNFT {
+    function botToTokenId(bytes32 _botId) external view returns (uint256);
+    function ownerOf(uint256 tokenId) external view returns (address);
+}
+
 /**
  * @title SnakeAgentsPariMutuel
  * @notice Pari-mutuel betting pool for Snake Agents (USDC version)
@@ -71,6 +76,11 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
     IERC20 public usdc;
     IBotRegistry public botRegistry;
     address public predictionRouter;
+    // CRIT-1 fix: authoritative source of bot ownership is the NFT.
+    // Runner reward claims and all owner checks derive the owner from
+    // snakeBotNFT.ownerOf(tokenId), so trading via ANY ERC-721 marketplace
+    // (BotMarketplace escrow, OpenSea, Blur, transferFrom, etc.) is supported.
+    ISnakeBotNFT public snakeBotNFT;
 
     // Runner rewards tracking
     uint256 public totalRunnerRewardsAccumulated; // lifetime total (only increases, includes claimed)
@@ -146,6 +156,7 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
     event PlatformFeesWithdrawn(uint256 amount);
     event RunnerRewardsClaimed(bytes32 indexed botId, address indexed owner, uint256 amount);
     event PredictionRouterUpdated(address indexed router);
+    event SnakeBotNFTUpdated(address indexed nft);
 
     // ============ Modifiers ============
 
@@ -194,7 +205,9 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
     {
         require(_amount >= MIN_BET, "Bet amount must be >= 1 USDC");
         require(_botId != bytes32(0), "Invalid bot ID");
-        require(!matches[_matchId].bettingLocked, "Betting locked");
+        // PHASE 3b: bettingLocked check removed — timestamp check below already
+        // enforces "no bets after match starts" (BETTING_WINDOW=0). The lockBetting
+        // tx is now redundant and no longer sent by backend, saving 1 tx per match.
         require(block.timestamp < matches[_matchId].startTime + BETTING_WINDOW, "Betting closed");
 
         // Transfer USDC from bettor to this contract
@@ -221,7 +234,7 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
         require(_bettor != address(0), "Invalid bettor");
         require(_amount >= MIN_BET, "Bet amount must be >= 1 USDC");
         require(_botId != bytes32(0), "Invalid bot ID");
-        require(!matches[_matchId].bettingLocked, "Betting locked");
+        // PHASE 3b: bettingLocked removed (see placeBet for rationale).
         require(block.timestamp < matches[_matchId].startTime + BETTING_WINDOW, "Betting closed");
 
         _recordBet(_bettor, _matchId, _botId, _amount);
@@ -269,6 +282,26 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
         external
         onlyOracle
     {
+        _createMatchInternal(_matchId, _startTime);
+    }
+
+    /**
+     * @notice PHASE 3a: batch-create up to 50 matches in one tx.
+     *         Saves ~70% gas vs sequential calls (base 21k overhead amortized).
+     */
+    function batchCreateMatch(uint256[] calldata _matchIds, uint256[] calldata _startTimes)
+        external
+        onlyOracle
+    {
+        uint256 n = _matchIds.length;
+        require(n == _startTimes.length, "Length mismatch");
+        require(n > 0 && n <= 50, "Batch size 1-50");
+        for (uint256 i = 0; i < n; i++) {
+            _createMatchInternal(_matchIds[i], _startTimes[i]);
+        }
+    }
+
+    function _createMatchInternal(uint256 _matchId, uint256 _startTime) internal {
         require(matches[_matchId].matchId == 0, "Match already exists");
         require(_startTime > block.timestamp, "Start time must be in future");
 
@@ -302,6 +335,39 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
         matchExists(_matchId)
         matchNotSettled(_matchId)
     {
+        _settleMatchInternal(_matchId, _winners);
+    }
+
+    /**
+     * @notice PHASE 3c: batch-settle up to 20 matches in one tx.
+     *         All-or-nothing: backend pre-validates each input. If any fails,
+     *         entire batch reverts (saves accidental partial settles).
+     */
+    function batchSettleMatch(
+        uint256[] calldata _matchIds,
+        bytes32[][] calldata _winnersList
+    )
+        external
+        nonReentrant
+        onlyOracle
+    {
+        uint256 n = _matchIds.length;
+        require(n == _winnersList.length, "Length mismatch");
+        require(n > 0 && n <= 20, "Batch size 1-20");
+        for (uint256 i = 0; i < n; i++) {
+            require(matches[_matchIds[i]].matchId != 0, "Match does not exist");
+            require(!matches[_matchIds[i]].settled, "Already settled");
+            require(!matches[_matchIds[i]].cancelled, "Already cancelled");
+            // NOTE: single-bettor matches auto-cancel inside _settleMatchInternal
+            // without reverting (matchData.cancelled = true, return). A batch can
+            // therefore contain a mix of true settles and silent auto-cancels —
+            // backend must check matchData.cancelled per-match after the batch
+            // confirms, not assume all entries are settled.
+            _settleMatchInternal(_matchIds[i], _winnersList[i]);
+        }
+    }
+
+    function _settleMatchInternal(uint256 _matchId, bytes32[] calldata _winners) internal {
         require(_winners.length > 0 && _winners.length <= 3, "Need 1-3 winners");
         require(block.timestamp >= matches[_matchId].startTime, "Match not started");
         // Validate winners: no zeros, no duplicates
@@ -459,6 +525,24 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
     }
 
     /**
+     * @notice PHASE 3c: batch-cancel up to 50 matches in one tx (e.g. matches with no bets).
+     */
+    function batchCancelMatch(uint256[] calldata _matchIds, string calldata _reason)
+        external
+        onlyOracle
+    {
+        uint256 n = _matchIds.length;
+        require(n > 0 && n <= 50, "Batch size 1-50");
+        for (uint256 i = 0; i < n; i++) {
+            require(matches[_matchIds[i]].matchId != 0, "Match does not exist");
+            require(!matches[_matchIds[i]].settled, "Already settled");
+            require(!matches[_matchIds[i]].cancelled, "Already cancelled");
+            matches[_matchIds[i]].cancelled = true;
+            emit MatchCancelled(_matchIds[i], _reason);
+        }
+    }
+
+    /**
      * @notice Anyone can trigger refund if Oracle fails to settle/cancel within MATCH_TIMEOUT.
      */
     function emergencyRefundMatch(uint256 _matchId)
@@ -529,14 +613,28 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
     // ============ Runner Rewards ============
 
     /**
+     * @notice Resolve the authoritative owner of a bot — the ERC-721 NFT holder.
+     * @dev    CRIT-1 fix: rewards follow NFT ownership, so any ERC-721
+     *         marketplace (BotMarketplace escrow, OpenSea, Blur, direct
+     *         transferFrom) transparently moves reward entitlement.
+     */
+    function _resolveBotOwner(bytes32 _botId) internal view returns (address) {
+        require(address(snakeBotNFT) != address(0), "NFT contract not set");
+        uint256 tokenId = snakeBotNFT.botToTokenId(_botId);
+        require(tokenId > 0, "Bot has no NFT");
+        return snakeBotNFT.ownerOf(tokenId);
+    }
+
+    /**
      * @notice Bot Owner claims accumulated runner rewards for a specific bot.
+     * @dev Owner is verified via the SnakeBotNFT contract, not BotRegistry.
+     *      This makes rewards follow NFT ownership across any marketplace.
      */
     function claimRunnerRewards(bytes32 _botId) external nonReentrant {
         uint256 amount = pendingRunnerRewards[_botId];
         require(amount > 0, "No runner rewards");
 
-        // Verify caller is bot owner via BotRegistry
-        address botOwner = botRegistry.getBotById(_botId).owner;
+        address botOwner = _resolveBotOwner(_botId);
         require(botOwner == msg.sender, "Not bot owner");
 
         pendingRunnerRewards[_botId] = 0;
@@ -547,15 +645,20 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
 
     /**
      * @notice Batch claim runner rewards for multiple bots owned by caller.
+     * @dev Same NFT-based ownership check as claimRunnerRewards.
      */
     function claimRunnerRewardsBatch(bytes32[] calldata _botIds) external nonReentrant {
+        require(address(snakeBotNFT) != address(0), "NFT contract not set");
         uint256 totalAmount = 0;
 
         for (uint i = 0; i < _botIds.length; i++) {
             uint256 amount = pendingRunnerRewards[_botIds[i]];
             if (amount == 0) continue;
 
-            address botOwner = botRegistry.getBotById(_botIds[i]).owner;
+            // Inlined owner check to avoid repeated `address(0)` checks.
+            uint256 tokenId = snakeBotNFT.botToTokenId(_botIds[i]);
+            require(tokenId > 0, "Bot has no NFT");
+            address botOwner = snakeBotNFT.ownerOf(tokenId);
             require(botOwner == msg.sender, "Not bot owner");
 
             pendingRunnerRewards[_botIds[i]] = 0;
@@ -711,6 +814,12 @@ contract SnakeAgentsPariMutuel is Ownable, ReentrancyGuard, Pausable {
 
     function setUsdc(address _usdc) external onlyOwner {
         usdc = IERC20(_usdc);
+    }
+
+    /// @notice Set the SnakeBotNFT contract (CRIT-1 fix — authoritative owner source).
+    function setSnakeBotNFT(address _nft) external onlyOwner {
+        snakeBotNFT = ISnakeBotNFT(_nft);
+        emit SnakeBotNFTUpdated(_nft);
     }
 
     function pause() external onlyOwner {
